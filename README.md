@@ -30,6 +30,34 @@ PaperForge automates the full lifecycle of academic paper generation — from id
 - **Training watchdog**: auto-detect stale training and restart with resume
 - **Docker support**: reproducible training environment with GPU + LaTeX
 
+## Recommended Model Routing Strategy
+
+PaperForge supports multi-model routing — assigning different LLMs to different pipeline stages for optimal results. Below is a recommended configuration based on each model's strengths:
+
+| Pipeline Stage | Recommended Model | Rationale |
+|---------------|-------------------|-----------|
+| **Idea Generation** (creative / novel viewpoints) | **Grok** | Excels at divergent thinking and generating unconventional, creative research angles |
+| **Innovation Validation** (reasoning / feasibility check) | **Gemini** | Strong logical reasoning capabilities; ideal for verifying whether a proposed innovation is theoretically sound and practically feasible |
+| **Paper Writing** (formal academic prose) | **Claude** | Produces the most natural, human-like academic writing with nuanced expression and consistent style |
+| **Code Generation** (experiment implementation) | **GPT Codex** | Supports the longest context window (up to 200k+ tokens), enabling continuous, uninterrupted coding sessions across large codebases |
+
+**Example `key.sh` configuration:**
+
+```bash
+# Idea model → Grok (via OpenAI-compatible API)
+export OPENAI_API_KEY='your-grok-api-key'
+export OPENAI_BASE_URL='https://api.x.ai/v1'
+
+# Writeup model → Claude (Anthropic native)
+export ANTHROPIC_API_KEY='your-anthropic-key'
+
+# Code model → GPT Codex (OpenAI)
+export OPENAI_WRITEUP_API_KEY='your-openai-key'
+export OPENAI_WRITEUP_BASE_URL='https://api.openai.com/v1'
+```
+
+> **Tip**: You can also use `launch_user_entry.py` to interactively assign models per stage, or pass `--idea-model`, `--code-model`, `--writeup-model`, `--review-model` flags to `launch_scientist.py`.
+
 ## Architecture
 
 ### Overview: Entry Points and Five-Phase Pipeline
