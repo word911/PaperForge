@@ -511,7 +511,7 @@ if __name__ == "__main__":
     writeup_client, writeup_client_model = create_client(writeup_model)
     review_client, review_client_model = create_client(review_model)
 
-    results_dir = osp.join("results", args.experiment)
+    results_dir = osp.join("workspace", "results", args.experiment)
     ideas = generate_ideas(
         base_dir,
         client=idea_client,

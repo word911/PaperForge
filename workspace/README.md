@@ -6,4 +6,4 @@ This directory stores runtime artifacts generated during pipeline execution.
 
 - `results/`: generated experiment and workflow workspaces
 
-Existing commands that reference `results/...` continue to work via the compatibility symlink at the project root.
+From the repository root, always reference outputs as `workspace/results/...`.

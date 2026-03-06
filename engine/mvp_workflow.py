@@ -49,7 +49,7 @@ def create_workspace_from_template(experiment: str, idea_name: str) -> str:
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_name = f"{timestamp}_{slugify(idea_name, default=experiment)}"
-    workspace = osp.join("results", experiment, run_name)
+    workspace = osp.join("workspace", "results", experiment, run_name)
     if osp.exists(workspace):
         raise FileExistsError(f"Workspace already exists: {workspace}")
 

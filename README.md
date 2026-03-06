@@ -313,6 +313,8 @@ python launch_scientist.py \
   --skip-novelty-check
 ```
 
+Outputs are created under `workspace/results/<experiment>/<timestamp_idea>/`.
+
 **Phased pipeline** (step by step):
 
 ```bash
@@ -405,7 +407,7 @@ cfg = GateConfig(
     seed_std_max=0.010,
 )
 decision = evaluate_gate(seed_values=[0.87, 0.89, 0.88], config=cfg)
-decision.save("./results/gate/")
+decision.save("./workspace/results/gate/")
 ```
 
 Outputs `gate_decision.json` and `gate_decision.md` with action, thresholds, and details.
