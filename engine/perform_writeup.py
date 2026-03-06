@@ -385,10 +385,38 @@ def _sanitize_template_tex_contents(tex_text: str) -> str:
     return re.sub(r"(\\cite[a-zA-Z*]*)\{([^}]*)\}", _rewrite_cites, tex_text)
 
 
+_DISCLOSURE_BLOCK = r"""
+%% ── AI Disclosure (required by The AI Scientist Source Code License §3.2.e) ──
+%% DO NOT REMOVE THIS SECTION — it is a legal requirement of the upstream license.
+\section*{Disclosure}
+\label{sec:disclosure}
+Portions of this manuscript, including drafting, iterative refinement, and
+formatting, were conducted with the assistance of PaperForge, an AI-powered
+academic writing pipeline. All experimental results, analysis, and scientific
+claims have been reviewed and validated by the authors. This disclosure is made
+in compliance with The AI Scientist Source Code License (Sakana AI).
+""".strip()
+
+
+def _ensure_disclosure(tex_text: str) -> str:
+    if r"\section*{Disclosure}" in tex_text:
+        return tex_text
+    anchor = r"\bibliographystyle"
+    idx = tex_text.find(anchor)
+    if idx != -1:
+        return tex_text[:idx] + _DISCLOSURE_BLOCK + "\n\n" + tex_text[idx:]
+    anchor2 = r"\end{document}"
+    idx2 = tex_text.find(anchor2)
+    if idx2 != -1:
+        return tex_text[:idx2] + _DISCLOSURE_BLOCK + "\n\n" + tex_text[idx2:]
+    return tex_text
+
+
 def _sanitize_template_tex_file(path: str) -> None:
     with open(path, "r", encoding="utf-8") as f:
         tex_text = f.read()
     sanitized = _sanitize_template_tex_contents(tex_text)
+    sanitized = _ensure_disclosure(sanitized)
     if sanitized != tex_text:
         with open(path, "w", encoding="utf-8") as f:
             f.write(sanitized)
@@ -487,6 +515,7 @@ If duplicated, identify the best location for the section header and remove any 
 
 Make the minimal fix required and do not remove or change any packages.
 Pay attention to any accidental uses of HTML syntax, e.g. </end instead of \\end.
+IMPORTANT: Do NOT remove or modify the \\section*{{Disclosure}} block — it is legally required.
 """
             coder.run(prompt)
             _sanitize_template_tex_file(writeup_file)
@@ -606,6 +635,7 @@ error_list = """- Unenclosed math symbols
 - Duplicate headers, e.g. duplicated \\section{{Introduction}} or \\end{{document}}
 - Unescaped symbols, e.g. shakespeare_char should be shakespeare\\_char in text
 - Incorrect closing of environments, e.g. </end{{figure}}> instead of \\end{{figure}}
+- NEVER remove or modify the \\section*{{Disclosure}} block — it is a legal requirement
 """
 
 refinement_prompt = (
