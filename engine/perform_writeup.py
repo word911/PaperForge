@@ -422,6 +422,90 @@ def _sanitize_template_tex_file(path: str) -> None:
             f.write(sanitized)
 
 
+_FIGURE_EXTENSIONS = (".png", ".pdf", ".jpg", ".jpeg", ".eps")
+
+
+def _extract_includegraphics_references(tex_text: str) -> List[str]:
+    refs = re.findall(r"\\includegraphics(?:\[[^\]]*\])?{(.*?)}", tex_text)
+    return [ref.strip() for ref in refs if ref and ref.strip()]
+
+
+def _figure_reference_variants(reference: str) -> List[str]:
+    rel = reference.strip().lstrip("./")
+    if not rel:
+        return []
+    ext = osp.splitext(rel)[1]
+    if ext:
+        return [rel]
+    return [f"{rel}{suffix}" for suffix in _FIGURE_EXTENSIONS]
+
+
+def _sync_referenced_figures_to_latex(
+    workspace_dir: str,
+    latex_dir: str,
+    references: List[str],
+) -> Tuple[List[str], List[str]]:
+    copied: List[str] = []
+    missing: List[str] = []
+    workspace_dir_abs = osp.abspath(workspace_dir)
+    latex_dir_abs = osp.abspath(latex_dir)
+
+    for raw_ref in references:
+        ref = raw_ref.strip()
+        if not ref or "://" in ref or osp.isabs(ref):
+            continue
+        normalized = ref.lstrip("./")
+        if normalized.startswith(".."):
+            continue
+
+        variants = _figure_reference_variants(normalized)
+        if not variants:
+            continue
+
+        copied_this_ref = False
+        for rel_variant in variants:
+            source_candidates = [rel_variant, osp.basename(rel_variant)]
+            source_path = ""
+            for source_rel in source_candidates:
+                candidate = osp.join(workspace_dir_abs, source_rel)
+                if osp.isfile(candidate):
+                    source_path = candidate
+                    break
+
+            if not source_path:
+                continue
+
+            target_path = osp.join(latex_dir_abs, rel_variant)
+            if osp.abspath(source_path) == osp.abspath(target_path):
+                copied_this_ref = True
+                break
+
+            os.makedirs(osp.dirname(target_path), exist_ok=True)
+            shutil.copy2(source_path, target_path)
+            copied.append(rel_variant)
+            copied_this_ref = True
+            break
+
+        if not copied_this_ref:
+            missing.append(normalized)
+
+    return copied, missing
+
+
+def _figure_reference_exists(reference: str, workspace_dir: str, latex_dir: str) -> bool:
+    variants = _figure_reference_variants(reference)
+    workspace_dir_abs = osp.abspath(workspace_dir)
+    latex_dir_abs = osp.abspath(latex_dir)
+    for rel_variant in variants:
+        if osp.isfile(osp.join(latex_dir_abs, rel_variant)):
+            return True
+        if osp.isfile(osp.join(workspace_dir_abs, rel_variant)):
+            return True
+        if osp.isfile(osp.join(workspace_dir_abs, osp.basename(rel_variant))):
+            return True
+    return False
+
+
 # GENERATE LATEX
 def generate_latex(
     coder,
@@ -461,14 +545,25 @@ If so, please modify the citation in template.tex to match the name in reference
     # Check all included figures are actually in the directory.
     with open(writeup_file, "r") as f:
         tex_text = f.read()
-    referenced_figs = re.findall(r"\\includegraphics.*?{(.*?)}", tex_text)
-    all_figs = [f for f in os.listdir(folder) if f.endswith(".png")]
+    referenced_figs = _extract_includegraphics_references(tex_text)
+    synced_figs, missing_figs = _sync_referenced_figures_to_latex(folder, cwd, referenced_figs)
+    if synced_figs:
+        print(f"Synchronized {len(synced_figs)} figure(s) into latex/: {sorted(set(synced_figs))}")
+    all_figs = sorted(
+        {
+            f
+            for f in os.listdir(folder)
+            if f.endswith((".png", ".pdf", ".jpg", ".jpeg", ".eps"))
+        }
+    )
     for figure in referenced_figs:
-        if figure not in all_figs:
+        if not _figure_reference_exists(figure, folder, cwd):
             print(f"Figure {figure} not found in directory.")
             prompt = f"""The image {figure} not found in the directory. The images in the directory are: {all_figs}.
 Please ensure that the figure is in the directory and that the filename is correct. Check the notes to see what each figure contains."""
             coder.run(prompt)
+    if missing_figs:
+        print(f"Missing referenced figure(s) after sync: {sorted(set(missing_figs))}")
 
     # Remove duplicate figures.
     with open(writeup_file, "r") as f:
@@ -529,6 +624,10 @@ IMPORTANT: Do NOT remove or modify the \\section*{{Disclosure}} block — it is 
                 )
         else:
             break
+    with open(writeup_file, "r") as f:
+        final_tex_text = f.read()
+    final_refs = _extract_includegraphics_references(final_tex_text)
+    _sync_referenced_figures_to_latex(folder, cwd, final_refs)
     return compile_latex(cwd, pdf_file, timeout=timeout)
 
 

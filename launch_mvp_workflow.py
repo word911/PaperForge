@@ -14,6 +14,8 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+_AIDER_OPENAI_PROTOCOL_CACHE: dict[tuple[str, str], str] = {}
+
 
 def _in_virtualenv() -> bool:
     return bool(getattr(sys, "base_prefix", sys.prefix) != sys.prefix)
@@ -62,10 +64,17 @@ def _build_aider_model(model_name: str):
     from aider.models import Model
 
     def _first_non_empty_env(*keys: str) -> str | None:
+        def _is_placeholder(value: str) -> bool:
+            normalized = value.strip().lower()
+            return normalized.startswith("your_") or normalized.startswith("your-")
+
         for key in keys:
             value = os.getenv(key)
             if value and value.strip():
-                return value.strip()
+                cleaned = value.strip()
+                if _is_placeholder(cleaned):
+                    continue
+                return cleaned
         return None
 
     def _with_openai_headers(m: Model) -> Model:
@@ -114,6 +123,76 @@ def _build_aider_model(model_name: str):
         m.extra_params.setdefault("max_tokens", compat_max)
         return m
 
+    def _openai_protocol_override() -> str:
+        mode = os.getenv("PAPERFORGE_OPENAI_PROTOCOL", "auto").strip().lower()
+        if mode in {"chat", "responses", "auto"}:
+            return mode
+        return "auto"
+
+    def _is_legacy_chat_protocol_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        if "/v1/chat/completions" in text and "/v1/responses" in text:
+            return True
+        return "unsupported legacy protocol" in text and "responses" in text
+
+    def _resolve_openai_protocol_for_model(openai_model_name: str) -> str:
+        override = _openai_protocol_override()
+        if override in {"chat", "responses"}:
+            return override
+
+        api_key = _first_non_empty_env(
+            "OPENAI_WRITEUP_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+        )
+        api_base = _first_non_empty_env(
+            "OPENAI_API_BASE",
+            "OPENAI_WRITEUP_BASE_URL",
+            "OPENAI_BASE_URL",
+            "ANTHROPIC_BASE_URL",
+        )
+        if not api_key or not api_base:
+            return "chat"
+
+        api_base = api_base.strip().rstrip("/")
+        if not api_base.endswith("/v1"):
+            api_base = f"{api_base}/v1"
+
+        cache_key = (api_base, openai_model_name)
+        cached = _AIDER_OPENAI_PROTOCOL_CACHE.get(cache_key)
+        if cached in {"chat", "responses"}:
+            return cached
+
+        try:
+            from openai import OpenAI
+
+            headers = {
+                "User-Agent": os.getenv("OPENAI_USER_AGENT", "curl/8.7.1"),
+            }
+            anthropic_beta = os.getenv("PAPERFORGE_ANTHROPIC_BETA", "").strip()
+            if anthropic_beta:
+                headers["anthropic-beta"] = anthropic_beta
+
+            probe_client = OpenAI(api_key=api_key, base_url=api_base, default_headers=headers)
+            probe_client.chat.completions.create(
+                model=openai_model_name,
+                messages=[{"role": "user", "content": "ping"}],
+                max_tokens=1,
+            )
+            protocol = "chat"
+        except Exception as exc:
+            protocol = "responses" if _is_legacy_chat_protocol_error(exc) else "chat"
+
+        _AIDER_OPENAI_PROTOCOL_CACHE[cache_key] = protocol
+        return protocol
+
+    def _openai_model_ref(openai_model_name: str) -> str:
+        protocol = _resolve_openai_protocol_for_model(openai_model_name)
+        if protocol == "responses":
+            return f"openai/responses/{openai_model_name}"
+        return f"openai/{openai_model_name}"
+
     route_claude_via_openai = os.getenv("PAPERFORGE_CLAUDE_OPENAI_COMPAT", "0").strip().lower() in {
         "1",
         "true",
@@ -122,7 +201,7 @@ def _build_aider_model(model_name: str):
     }
 
     if model_name == "gpt-5.3-codex xhigh":
-        return _with_openai_headers(Model("openai/gpt-5.3-codex-xhigh"))
+        return _with_openai_headers(Model(_openai_model_ref("gpt-5.3-codex-xhigh")))
     if model_name == "deepseek-coder-v2-0724":
         return Model("deepseek/deepseek-coder")
     if model_name == "deepseek-reasoner":
@@ -130,11 +209,11 @@ def _build_aider_model(model_name: str):
     if model_name == "llama3.1-405b":
         return Model("openrouter/meta-llama/llama-3.1-405b-instruct")
     if model_name.startswith("claude-") and route_claude_via_openai:
-        return _with_openai_headers(Model(f"openai/{model_name}"))
+        return _with_openai_headers(Model(_openai_model_ref(model_name)))
     if model_name.startswith("claude-"):
         return Model(f"anthropic/{model_name}")
     if model_name.startswith("gpt-") or model_name.startswith("o1") or model_name.startswith("o3"):
-        return _with_openai_headers(Model(f"openai/{model_name}"))
+        return _with_openai_headers(Model(_openai_model_ref(model_name)))
     return Model(model_name)
 
 

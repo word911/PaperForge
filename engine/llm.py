@@ -23,7 +23,9 @@ AVAILABLE_LLMS = [
     "claude-opus-4.6",
     "claude-opus-4-6",
     # OpenAI models
+    "gpt-5.2",
     "gpt-5.2-xhigh",
+    "gpt-5.2-codex",
     "gpt-5.3",
     "gpt-5.3-codex",
     "gpt-5.3-codex-xhigh",
@@ -236,11 +238,205 @@ def _normalize_openai_base_url(base_url: str) -> str:
     return f"{cleaned}/v1"
 
 
+_OPENAI_PROTOCOL_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _openai_protocol_override() -> str:
+    mode = os.getenv("PAPERFORGE_OPENAI_PROTOCOL", "auto").strip().lower()
+    if mode in {"chat", "responses", "auto"}:
+        return mode
+    return "auto"
+
+
+def _openai_protocol_cache_key(client, model: str) -> tuple[str, str]:
+    base_url = str(getattr(client, "base_url", "")).strip().rstrip("/")
+    return base_url, model
+
+
+def _get_cached_openai_protocol(client, model: str) -> str | None:
+    return _OPENAI_PROTOCOL_CACHE.get(_openai_protocol_cache_key(client, model))
+
+
+def _set_cached_openai_protocol(client, model: str, protocol: str) -> None:
+    if protocol not in {"chat", "responses"}:
+        return
+    _OPENAI_PROTOCOL_CACHE[_openai_protocol_cache_key(client, model)] = protocol
+
+
+def _is_legacy_chat_protocol_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "/v1/chat/completions" in text and "/v1/responses" in text:
+        return True
+    return "unsupported legacy protocol" in text and "responses" in text
+
+
+def _is_responses_protocol_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    if "/v1/responses" in text and ("not supported" in text or "unsupported" in text):
+        return True
+    return "/v1/responses" in text and "not found" in text
+
+
+def _extract_openai_responses_text(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text:
+        return output_text
+
+    texts: list[str] = []
+    outputs = getattr(response, "output", None) or []
+    for item in outputs:
+        content_blocks = getattr(item, "content", None) or []
+        for block in content_blocks:
+            text = getattr(block, "text", None)
+            if isinstance(text, str) and text:
+                texts.append(text)
+    return "\n".join(texts).strip()
+
+
+def _openai_chat_request(
+    client,
+    *,
+    request_model: str,
+    messages,
+    temperature: float | None,
+    max_tokens: int | None,
+    n_responses: int,
+    stop,
+    seed: int | None,
+    extra_kwargs: dict | None,
+):
+    kwargs = {
+        "model": request_model,
+        "messages": messages,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if n_responses > 0:
+        kwargs["n"] = n_responses
+    if stop is not None:
+        kwargs["stop"] = stop
+    if seed is not None:
+        kwargs["seed"] = seed
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
+    return client.chat.completions.create(**kwargs)
+
+
+def _openai_responses_request(
+    client,
+    *,
+    request_model: str,
+    messages,
+    temperature: float | None,
+    max_tokens: int | None,
+    stop,
+    extra_kwargs: dict | None,
+):
+    kwargs = {
+        "model": request_model,
+        "input": messages,
+    }
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        kwargs["max_output_tokens"] = max_tokens
+    if stop is not None:
+        kwargs["stop"] = stop
+    if extra_kwargs:
+        response_kwargs = dict(extra_kwargs)
+        reasoning_effort = response_kwargs.pop("reasoning_effort", None)
+        if reasoning_effort:
+            response_kwargs["reasoning"] = {"effort": reasoning_effort}
+        kwargs.update(response_kwargs)
+
+    return client.responses.create(**kwargs)
+
+
+def _openai_generate_texts(
+    *,
+    client,
+    request_model: str,
+    messages,
+    temperature: float | None,
+    max_tokens: int | None,
+    n_responses: int = 1,
+    stop=None,
+    seed: int | None = None,
+    extra_kwargs: dict | None = None,
+) -> list[str]:
+    n_responses = max(1, int(n_responses))
+    override = _openai_protocol_override()
+
+    cached = _get_cached_openai_protocol(client, request_model)
+    preferred = override if override in {"chat", "responses"} else (cached or "chat")
+
+    if preferred == "chat":
+        try:
+            response = _openai_chat_request(
+                client,
+                request_model=request_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                n_responses=n_responses,
+                stop=stop,
+                seed=seed,
+                extra_kwargs=extra_kwargs,
+            )
+            _set_cached_openai_protocol(client, request_model, "chat")
+            return [choice.message.content for choice in response.choices]
+        except Exception as exc:
+            if override == "chat" or not _is_legacy_chat_protocol_error(exc):
+                raise
+            _set_cached_openai_protocol(client, request_model, "responses")
+
+    try:
+        texts: list[str] = []
+        for _ in range(n_responses):
+            response = _openai_responses_request(
+                client,
+                request_model=request_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stop=stop,
+                extra_kwargs=extra_kwargs,
+            )
+            texts.append(_extract_openai_responses_text(response))
+        _set_cached_openai_protocol(client, request_model, "responses")
+        return texts
+    except Exception as exc:
+        if override == "responses" or not _is_responses_protocol_error(exc):
+            raise
+        response = _openai_chat_request(
+            client,
+            request_model=request_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            n_responses=n_responses,
+            stop=stop,
+            seed=seed,
+            extra_kwargs=extra_kwargs,
+        )
+        _set_cached_openai_protocol(client, request_model, "chat")
+        return [choice.message.content for choice in response.choices]
+
+
 def _first_non_empty_env(*names):
+    def _is_placeholder(value: str) -> bool:
+        normalized = value.strip().lower()
+        return normalized.startswith("your_") or normalized.startswith("your-")
+
     for name in names:
         value = os.getenv(name)
         if value and value.strip():
-            return value.strip()
+            cleaned = value.strip()
+            if _is_placeholder(cleaned):
+                continue
+            return cleaned
     return None
 
 
@@ -535,20 +731,20 @@ def get_batch_responses_from_llm(
         if 'gpt' in model:
             request_model, extra_kwargs = _resolve_openai_model_and_reasoning(model)
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=request_model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=request_model,
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
-            n=n_responses,
+            n_responses=n_responses,
             stop=None,
             seed=0,
-            **extra_kwargs,
+            extra_kwargs=extra_kwargs,
         )
-        content = [r.message.content for r in response.choices]
         new_msg_history = [
             new_msg_history + [{"role": "assistant", "content": c}] for c in content
         ]
@@ -697,107 +893,122 @@ def get_response_from_llm(
         if model.startswith("claude-"):
             request_model, extra_kwargs = model, {}
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=request_model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=request_model,
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
-            n=1,
+            n_responses=1,
             stop=None,
             seed=0,
-            **extra_kwargs,
-        )
-        content = response.choices[0].message.content
+            extra_kwargs=extra_kwargs,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif model.startswith("grok-"):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=model,
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
-            n=1,
+            n_responses=1,
             stop=None,
-        )
-        content = response.choices[0].message.content
+            seed=None,
+            extra_kwargs=None,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif "o1" in model or "o3" in model:
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=model,
             messages=[
                 {"role": "user", "content": system_message},
                 *new_msg_history,
             ],
             temperature=1,
-            max_completion_tokens=MAX_NUM_TOKENS,
-            n=1,
+            max_tokens=MAX_NUM_TOKENS,
+            n_responses=1,
+            stop=None,
             seed=0,
-        )
-        content = response.choices[0].message.content
+            extra_kwargs=None,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif model in ["meta-llama/llama-3.1-405b-instruct", "llama-3-1-405b-instruct"]:
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model="meta-llama/llama-3.1-405b-instruct",
+        content = _openai_generate_texts(
+            client=client,
+            request_model="meta-llama/llama-3.1-405b-instruct",
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
-            n=1,
+            n_responses=1,
             stop=None,
-        )
-        content = response.choices[0].message.content
+            seed=None,
+            extra_kwargs=None,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif model in ["deepseek-chat", "deepseek-coder"]:
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=model,
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
-            n=1,
+            n_responses=1,
             stop=None,
-        )
-        content = response.choices[0].message.content
+            seed=None,
+            extra_kwargs=None,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif model in ["deepseek-reasoner"]:
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=model,
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
-            n=1,
+            temperature=None,
+            max_tokens=None,
+            n_responses=1,
             stop=None,
-        )
-        content = response.choices[0].message.content
+            seed=None,
+            extra_kwargs=None,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     elif "gemini" in model:
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
-        response = client.chat.completions.create(
-            model=model,
+        content = _openai_generate_texts(
+            client=client,
+            request_model=model,
             messages=[
                 {"role": "system", "content": system_message},
                 *new_msg_history,
             ],
             temperature=temperature,
             max_tokens=MAX_NUM_TOKENS,
-            n=1,
-        )
-        content = response.choices[0].message.content
+            n_responses=1,
+            stop=None,
+            seed=None,
+            extra_kwargs=None,
+        )[0]
         new_msg_history = new_msg_history + [{"role": "assistant", "content": content}]
     else:
         raise ValueError(f"Model {model} not supported.")
