@@ -278,6 +278,8 @@ def _phase_bootstrap(args: argparse.Namespace, workspace: Path | None) -> Path:
             query=args.title,
             engine=args.engine,
             top_k=args.literature_top_k,
+            year_before=args.literature_year_before,
+            year_after=args.literature_year_after,
         )
 
     mvp_ok = False
@@ -336,6 +338,8 @@ def _phase_feedback(args: argparse.Namespace, workspace: Path) -> None:
             query=args.title,
             engine=args.engine,
             top_k=args.literature_top_k,
+            year_before=args.literature_year_before,
+            year_after=args.literature_year_after,
         )
 
     if not args.skip_writeup:
@@ -501,6 +505,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--refresh-literature", action="store_true")
     p.add_argument("--literature-top-k", type=int, default=5)
+    p.add_argument(
+        "--literature-year-before",
+        type=int,
+        default=None,
+        help="Only keep papers with year < this value (e.g. 2010).",
+    )
+    p.add_argument(
+        "--literature-year-after",
+        type=int,
+        default=None,
+        help="Only keep papers with year > this value.",
+    )
 
     p.add_argument("--run-cloud-cycle", action="store_true")
     p.add_argument(

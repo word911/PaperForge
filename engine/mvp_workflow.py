@@ -356,21 +356,56 @@ def refresh_notes_with_literature(
     query: str,
     engine: str = "openalex",
     top_k: int = 5,
+    year_before: Optional[int] = None,
+    year_after: Optional[int] = None,
 ) -> None:
+    top_k = max(1, int(top_k))
+    fetch_limit = top_k
+    if year_before is not None or year_after is not None:
+        # Fetch a wider pool first, then apply year filters locally.
+        fetch_limit = min(200, max(top_k * 5, 100))
+
     try:
-        papers = search_for_papers(query=query, result_limit=top_k, engine=engine) or []
+        papers = search_for_papers(query=query, result_limit=fetch_limit, engine=engine) or []
     except Exception as exc:
         block = f"## Literature Snapshot\nQuery: `{query}`\nSearch failed: {exc}"
         _upsert_notes_block(notes_path, "LITERATURE", block)
         return
 
-    if not papers:
-        block = f"## Literature Snapshot\nQuery: `{query}`\nNo papers found."
+    filtered_papers: List[Dict] = []
+    for paper in papers:
+        raw_year = paper.get("year")
+        try:
+            year = int(raw_year)
+        except (TypeError, ValueError):
+            continue
+        if year_before is not None and year >= int(year_before):
+            continue
+        if year_after is not None and year <= int(year_after):
+            continue
+        filtered_papers.append(paper)
+
+    final_papers = filtered_papers[:top_k]
+    if not final_papers:
+        filters = []
+        if year_before is not None:
+            filters.append(f"year < {year_before}")
+        if year_after is not None:
+            filters.append(f"year > {year_after}")
+        filter_text = f"\nFilters: {', '.join(filters)}" if filters else ""
+        block = f"## Literature Snapshot\nQuery: `{query}`{filter_text}\nNo papers found."
         _upsert_notes_block(notes_path, "LITERATURE", block)
         return
 
-    lines = ["## Literature Snapshot", f"Query: `{query}`", ""]
-    for i, paper in enumerate(papers, start=1):
+    lines = ["## Literature Snapshot", f"Query: `{query}`"]
+    if year_before is not None:
+        lines.append(f"Filter: year < {year_before}")
+    if year_after is not None:
+        lines.append(f"Filter: year > {year_after}")
+    lines.append(f"Returned: {len(final_papers)}")
+    lines.append("")
+
+    for i, paper in enumerate(final_papers, start=1):
         title = paper.get("title", "Untitled")
         year = paper.get("year", "?")
         venue = paper.get("venue", "Unknown")
