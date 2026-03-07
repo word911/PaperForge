@@ -600,6 +600,12 @@ def _phase_radar(args: argparse.Namespace, workspace: Path) -> None:
             year_before=year_max,
             year_after=year_min,
             recent_years=args.radar_recent_years,
+            translate_abstracts=args.radar_translate_abstracts,
+            translation_model=args.radar_translate_model,
+            translation_limit=args.radar_translate_limit,
+            detail_paper_limit=args.radar_detail_papers,
+            backfill_missing_abstracts=args.radar_backfill_abstracts,
+            abstract_backfill_limit=args.radar_backfill_limit,
         )
     except Exception as exc:
         raise SystemExit(f"[radar] failed: {exc}") from exc
@@ -735,6 +741,56 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Recent-year window used for method trend extraction.",
+    )
+    p.add_argument(
+        "--radar-translate-abstracts",
+        dest="radar_translate_abstracts",
+        action="store_true",
+        default=True,
+        help="Translate per-paper abstracts into Chinese in radar report.",
+    )
+    p.add_argument(
+        "--radar-no-translate-abstracts",
+        dest="radar_translate_abstracts",
+        action="store_false",
+        help="Disable abstract translation in radar report.",
+    )
+    p.add_argument(
+        "--radar-translate-model",
+        default="gpt-5.2",
+        choices=AVAILABLE_LLMS,
+        help="Model used for abstract translation in radar report.",
+    )
+    p.add_argument(
+        "--radar-translate-limit",
+        type=int,
+        default=50,
+        help="Maximum number of papers to translate per radar run.",
+    )
+    p.add_argument(
+        "--radar-detail-papers",
+        type=int,
+        default=50,
+        help="Number of papers with full abstract digest in radar report.",
+    )
+    p.add_argument(
+        "--radar-backfill-abstracts",
+        dest="radar_backfill_abstracts",
+        action="store_true",
+        default=True,
+        help="Backfill missing abstracts by title search (OpenAlex, then Semantic Scholar, then Brave Search, then SerpAPI Google Scholar if configured).",
+    )
+    p.add_argument(
+        "--radar-no-backfill-abstracts",
+        dest="radar_backfill_abstracts",
+        action="store_false",
+        help="Disable missing-abstract backfill.",
+    )
+    p.add_argument(
+        "--radar-backfill-limit",
+        type=int,
+        default=50,
+        help="Maximum number of missing-abstract papers to backfill per run.",
     )
 
     p.add_argument("--run-cloud-cycle", action="store_true")

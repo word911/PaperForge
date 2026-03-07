@@ -6,10 +6,14 @@ import re
 import tempfile
 from collections import Counter
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
 
 from engine.generate_ideas import search_for_papers
+from engine.llm import create_client, get_response_from_llm
 
 
 _TOPIC_EXPANSION_MAP: Dict[str, List[str]] = {
@@ -166,6 +170,21 @@ MAX_QUERY_CHARS = 180
 MAX_TITLE_KEY_CHARS = 200
 MAX_METHOD_INSIGHTS = 8
 MAX_MATCHED_QUERIES = 8
+MAX_ABSTRACT_TRANSLATION_INPUT_CHARS = 1800
+MAX_ABSTRACT_TRANSLATION_OUTPUT_CHARS = 2200
+DEFAULT_REPORT_PAPER_LIMIT = 50
+DEFAULT_TRANSLATION_LIMIT = 50
+DEFAULT_ABSTRACT_BACKFILL_LIMIT = 50
+ABSTRACT_BACKFILL_RESULT_LIMIT = 5
+MAX_ABSTRACT_BACKFILL_QUERY_CHARS = 260
+MIN_BACKFILL_TITLE_MATCH_SCORE = 0.78
+_SEMANTICSCHOLAR_BACKFILL_DISABLED = False
+SERPAPI_SCHOLAR_ENDPOINT = "https://serpapi.com/search.json"
+SERPAPI_CONNECT_TIMEOUT = 5
+SERPAPI_READ_TIMEOUT = 20
+BRAVE_WEB_SEARCH_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_CONNECT_TIMEOUT = 5
+BRAVE_READ_TIMEOUT = 20
 
 
 def _slugify(text: str, default: str = "topic") -> str:
@@ -309,6 +328,311 @@ def _atomic_write_text(path: Path, text: str) -> None:
                 pass
 
 
+def _resolve_optional_limit(value: Optional[int], *, default_value: int) -> int:
+    if value is None:
+        return max(0, int(default_value))
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return max(0, int(default_value))
+
+
+def _title_match_score(
+    target_title: str,
+    candidate_title: str,
+    *,
+    target_year: Optional[int],
+    candidate_year: Optional[int],
+) -> float:
+    target_norm = _normalize_title(target_title)
+    candidate_norm = _normalize_title(candidate_title)
+    if not target_norm or not candidate_norm:
+        return 0.0
+
+    if target_norm == candidate_norm:
+        score = 1.0
+    else:
+        score = SequenceMatcher(None, target_norm, candidate_norm).ratio()
+        if target_norm in candidate_norm or candidate_norm in target_norm:
+            score = max(score, 0.90 if min(len(target_norm), len(candidate_norm)) >= 24 else 0.84)
+
+    if target_year is not None and candidate_year is not None:
+        year_gap = abs(int(target_year) - int(candidate_year))
+        if year_gap == 0:
+            score += 0.03
+        elif year_gap >= 5:
+            score -= 0.05
+    return max(0.0, min(1.0, score))
+
+
+def _pick_best_abstract_candidate(
+    *,
+    target_title: str,
+    target_year: Optional[int],
+    candidates: List[Dict],
+) -> str:
+    best_score = 0.0
+    best_abstract = ""
+
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        candidate_title = _sanitize_text(raw.get("title"), max_chars=MAX_TITLE_CHARS)
+        candidate_abstract = _sanitize_text(raw.get("abstract"), max_chars=MAX_ABSTRACT_CHARS)
+        if not candidate_title or not candidate_abstract:
+            continue
+        score = _title_match_score(
+            target_title=target_title,
+            candidate_title=candidate_title,
+            target_year=target_year,
+            candidate_year=_extract_year(raw.get("year")),
+        )
+        if score > best_score:
+            best_score = score
+            best_abstract = candidate_abstract
+
+    if best_score < MIN_BACKFILL_TITLE_MATCH_SCORE:
+        return ""
+    return best_abstract
+
+
+def _extract_year_from_text(text: object) -> Optional[int]:
+    if text is None:
+        return None
+    matches = re.findall(r"\b(?:19|20)\d{2}\b", str(text))
+    for match in matches:
+        year = _extract_year(match)
+        if year is not None:
+            return year
+    return None
+
+
+def _search_serpapi_scholar_candidates(query: str, result_limit: int) -> List[Dict]:
+    api_key = os.getenv("SERPAPI_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    try:
+        rsp = requests.get(
+            SERPAPI_SCHOLAR_ENDPOINT,
+            params={
+                "engine": "google_scholar",
+                "q": query,
+                "api_key": api_key,
+                "num": max(1, int(result_limit)),
+                "hl": "en",
+            },
+            timeout=(SERPAPI_CONNECT_TIMEOUT, SERPAPI_READ_TIMEOUT),
+        )
+        rsp.raise_for_status()
+        payload = rsp.json() if rsp.content else {}
+    except requests.exceptions.HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        print(f"[radar] serpapi scholar HTTP error (status={status_code}): {exc}")
+        return []
+    except Exception as exc:
+        print(f"[radar] serpapi scholar query failed: {exc}")
+        return []
+
+    results = payload.get("organic_results", [])
+    if not isinstance(results, list):
+        return []
+
+    normalized: List[Dict] = []
+    for item in results[: max(1, int(result_limit))]:
+        if not isinstance(item, dict):
+            continue
+        title = _sanitize_text(item.get("title"), max_chars=MAX_TITLE_CHARS)
+        snippet = _sanitize_text(item.get("snippet"), max_chars=MAX_ABSTRACT_CHARS)
+        publication_info = item.get("publication_info") if isinstance(item.get("publication_info"), dict) else {}
+        summary = _sanitize_text(publication_info.get("summary"), max_chars=240)
+        if not title or not snippet:
+            continue
+        normalized.append(
+            {
+                "title": title,
+                "abstract": snippet,
+                "year": _extract_year_from_text(summary) or _extract_year_from_text(item.get("year")),
+                "venue": "Google Scholar",
+                "authors": "",
+                "citationCount": 0,
+            }
+        )
+    return normalized
+
+
+def _search_brave_web_candidates(query: str, result_limit: int) -> List[Dict]:
+    api_key = os.getenv("BRAVE_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    try:
+        rsp = requests.get(
+            BRAVE_WEB_SEARCH_ENDPOINT,
+            params={
+                "q": query,
+                "count": min(20, max(1, int(result_limit))),
+                "extra_snippets": "true",
+                "search_lang": "en",
+            },
+            headers={
+                "Accept": "application/json",
+                "X-Subscription-Token": api_key,
+            },
+            timeout=(BRAVE_CONNECT_TIMEOUT, BRAVE_READ_TIMEOUT),
+        )
+        rsp.raise_for_status()
+        payload = rsp.json() if rsp.content else {}
+    except requests.exceptions.HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        print(f"[radar] brave search HTTP error (status={status_code}): {exc}")
+        return []
+    except Exception as exc:
+        print(f"[radar] brave search query failed: {exc}")
+        return []
+
+    web_obj = payload.get("web") if isinstance(payload.get("web"), dict) else {}
+    results = web_obj.get("results", [])
+    if not isinstance(results, list):
+        return []
+
+    normalized: List[Dict] = []
+    for item in results[: max(1, int(result_limit))]:
+        if not isinstance(item, dict):
+            continue
+        title = _sanitize_text(item.get("title"), max_chars=MAX_TITLE_CHARS)
+        description = _sanitize_text(item.get("description"), max_chars=MAX_ABSTRACT_CHARS)
+        extra_snippets_raw = item.get("extra_snippets")
+        extra_snippets = extra_snippets_raw if isinstance(extra_snippets_raw, list) else []
+        extra_joined = " ".join(str(x) for x in extra_snippets if isinstance(x, str))
+        extra_text = _sanitize_text(extra_joined, max_chars=MAX_ABSTRACT_CHARS)
+        abstract = description or extra_text
+        if not title or not abstract:
+            continue
+
+        profile = item.get("profile") if isinstance(item.get("profile"), dict) else {}
+        venue = _sanitize_text(profile.get("name"), max_chars=MAX_VENUE_CHARS) or "Brave Search"
+        year = _extract_year_from_text(item.get("age")) or _extract_year_from_text(abstract)
+        normalized.append(
+            {
+                "title": title,
+                "abstract": abstract,
+                "year": year,
+                "venue": venue,
+                "authors": "",
+                "citationCount": 0,
+            }
+        )
+    return normalized
+
+
+def _search_engine_candidates(query: str, *, engine: str, result_limit: int) -> List[Dict]:
+    global _SEMANTICSCHOLAR_BACKFILL_DISABLED
+    if engine == "semanticscholar" and _SEMANTICSCHOLAR_BACKFILL_DISABLED:
+        return []
+
+    if engine == "serpapi_google_scholar":
+        return _search_serpapi_scholar_candidates(query=query, result_limit=result_limit)
+    if engine == "brave_web_search":
+        return _search_brave_web_candidates(query=query, result_limit=result_limit)
+
+    # `search_for_papers` is decorated with unbounded HTTP backoff. For the
+    # backfill path we bypass that wrapper to avoid long stalls on rate limits.
+    raw_search = getattr(search_for_papers, "__wrapped__", search_for_papers)
+    try:
+        results = raw_search(query=query, result_limit=result_limit, engine=engine) or []
+    except requests.exceptions.HTTPError as exc:
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        if engine == "semanticscholar" and status_code == 429:
+            _SEMANTICSCHOLAR_BACKFILL_DISABLED = True
+            print("[radar] semanticscholar backfill disabled for this run due to HTTP 429.")
+            return []
+        print(f"[radar] abstract backfill HTTP error ({engine}, status={status_code}): {exc}")
+        return []
+    except Exception as exc:
+        print(f"[radar] abstract backfill query failed ({engine}): {exc}")
+        return []
+    return [item for item in results if isinstance(item, dict)]
+
+
+def _backfill_abstract_by_title(title: str, year: Optional[int]) -> Tuple[str, str]:
+    query = _sanitize_text(title, max_chars=MAX_ABSTRACT_BACKFILL_QUERY_CHARS)
+    if not query:
+        return "", ""
+
+    query_variants = [f"\"{query}\"", query]
+    engines = ["openalex"]
+    if os.getenv("S2_API_KEY", "").strip():
+        engines.append("semanticscholar")
+    if os.getenv("BRAVE_API_KEY", "").strip():
+        engines.append("brave_web_search")
+    if os.getenv("SERPAPI_API_KEY", "").strip():
+        engines.append("serpapi_google_scholar")
+    seen_queries = set()
+
+    for engine in engines:
+        for variant in query_variants:
+            variant_norm = f"{engine}:{_normalize_topic(variant)}"
+            if variant_norm in seen_queries:
+                continue
+            seen_queries.add(variant_norm)
+
+            candidates = _search_engine_candidates(
+                variant,
+                engine=engine,
+                result_limit=ABSTRACT_BACKFILL_RESULT_LIMIT,
+            )
+            if not candidates:
+                continue
+            abstract = _pick_best_abstract_candidate(
+                target_title=title,
+                target_year=year,
+                candidates=candidates,
+            )
+            if abstract:
+                return abstract, engine
+    return "", ""
+
+
+def _translate_abstract_to_zh(
+    abstract: str,
+    *,
+    client: Any,
+    model: str,
+) -> str:
+    source = _sanitize_text(abstract, max_chars=MAX_ABSTRACT_TRANSLATION_INPUT_CHARS)
+    if not source:
+        return ""
+
+    system_message = (
+        "You are an expert bilingual quantitative-finance translator. "
+        "Translate English research abstracts into clear, faithful, academic Chinese."
+    )
+    user_message = (
+        "请把下面英文论文摘要翻译为中文学术风格。\n"
+        "要求：\n"
+        "1) 保留方法、数据、结论与限制；\n"
+        "2) 不新增原文没有的信息；\n"
+        "3) 用中文输出，2-5句；\n"
+        "4) 只输出译文，不要解释。\n\n"
+        f"Abstract:\n{source}"
+    )
+    try:
+        translated, _ = get_response_from_llm(
+            user_message,
+            client,
+            model,
+            system_message=system_message,
+            print_debug=False,
+            msg_history=None,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        print(f"[radar] abstract translation failed: {exc}")
+        return ""
+    return _sanitize_text(translated, max_chars=MAX_ABSTRACT_TRANSLATION_OUTPUT_CHARS)
+
+
 def _build_method_insights(
     seed_topic: str,
     theme_counts: Counter,
@@ -382,6 +706,10 @@ def _render_markdown_report(
     method_insights: List[str],
     generated_at: str,
     recent_year_threshold: int,
+    detail_paper_limit: int,
+    translated_count: int,
+    translation_model: Optional[str],
+    abstract_backfilled_count: int,
 ) -> str:
     theme_counts = Counter()
     recent_theme_counts = Counter()
@@ -400,6 +728,9 @@ def _render_markdown_report(
     lines.append(f"- Expanded topics: {len(expanded_topics)}")
     lines.append(f"- Papers kept: {len(papers)}")
     lines.append(f"- New since previous run: {len(new_papers)}")
+    lines.append(f"- Abstract translations generated: {translated_count}")
+    lines.append(f"- Abstracts backfilled (missing->found): {abstract_backfilled_count}")
+    lines.append(f"- Translation model: `{translation_model or 'N/A'}`")
     lines.append("")
 
     lines.append("## Expanded Topics")
@@ -431,6 +762,33 @@ def _render_markdown_report(
     else:
         lines.append("- No new papers detected compared with previous snapshot.")
     lines.append("")
+
+    detail_limit = min(len(papers), max(0, int(detail_paper_limit)))
+    lines.append(f"## Paper Abstract Digest (Top {detail_limit})")
+    if detail_limit <= 0:
+        lines.append("- No paper details requested.")
+        lines.append("")
+        return "\n".join(lines)
+
+    for i, paper in enumerate(papers[:detail_limit], start=1):
+        title = paper.get("title", "Untitled")
+        year = paper.get("year", "?")
+        venue = paper.get("venue", "Unknown")
+        cites = paper.get("citationCount", 0)
+        themes = ", ".join(paper.get("method_themes", [])) or "N/A"
+        abstract = paper.get("abstract", "") or "N/A"
+        abstract_zh = paper.get("abstract_zh", "") or "(未生成翻译)"
+
+        lines.append(f"### {i}. {title}")
+        lines.append(f"- Year: {year}")
+        lines.append(f"- Venue: {venue}")
+        lines.append(f"- Citations: {cites}")
+        lines.append(f"- Method themes: {themes}")
+        lines.append("- Abstract (EN)")
+        lines.append(f"> {abstract}")
+        lines.append("- 摘要翻译（ZH）")
+        lines.append(f"> {abstract_zh}")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -444,6 +802,12 @@ def run_literature_radar(
     year_before: Optional[int] = None,
     year_after: Optional[int] = None,
     recent_years: int = 3,
+    translate_abstracts: bool = True,
+    translation_model: str = "gpt-5.2",
+    translation_limit: Optional[int] = DEFAULT_TRANSLATION_LIMIT,
+    detail_paper_limit: Optional[int] = DEFAULT_REPORT_PAPER_LIMIT,
+    backfill_missing_abstracts: bool = True,
+    abstract_backfill_limit: Optional[int] = DEFAULT_ABSTRACT_BACKFILL_LIMIT,
 ) -> Dict:
     workspace_input = Path(workspace).expanduser()
     if workspace_input.is_symlink():
@@ -471,6 +835,22 @@ def run_literature_radar(
         _paper_key(item.get("title", ""), _extract_year(item.get("year")))
         for item in previous_snapshot.get("papers", [])
     }
+    previous_translation_map = {
+        _paper_key(item.get("title", ""), _extract_year(item.get("year"))): _sanitize_text(
+            item.get("abstract_zh"),
+            max_chars=MAX_ABSTRACT_TRANSLATION_OUTPUT_CHARS,
+        )
+        for item in previous_snapshot.get("papers", [])
+        if _sanitize_text(item.get("abstract_zh"), max_chars=MAX_ABSTRACT_TRANSLATION_OUTPUT_CHARS)
+    }
+    previous_abstract_map = {
+        _paper_key(item.get("title", ""), _extract_year(item.get("year"))): _sanitize_text(
+            item.get("abstract"),
+            max_chars=MAX_ABSTRACT_CHARS,
+        )
+        for item in previous_snapshot.get("papers", [])
+        if _sanitize_text(item.get("abstract"), max_chars=MAX_ABSTRACT_CHARS)
+    }
 
     topics = _expand_topics(seed_topic=seed_topic, max_topics=max_topics)
     if not topics:
@@ -478,16 +858,7 @@ def run_literature_radar(
 
     dedup: Dict[Tuple[str, int], Dict] = {}
 
-    for query in topics:
-        query = _sanitize_text(query, max_chars=MAX_QUERY_CHARS)
-        if not query:
-            continue
-        try:
-            results = search_for_papers(query=query, result_limit=per_topic, engine=engine) or []
-        except Exception as exc:
-            print(f"[radar] query failed: {query} ({exc})")
-            continue
-
+    def _ingest_results(query: str, results: List[Dict]) -> None:
         for raw in results:
             if not isinstance(raw, dict):
                 continue
@@ -533,6 +904,20 @@ def run_literature_radar(
                 if not dedup[key].get("abstract") and abstract:
                     dedup[key]["abstract"] = abstract
 
+    def _fetch_and_ingest(query: str, *, result_limit: int) -> None:
+        cleaned_query = _sanitize_text(query, max_chars=MAX_QUERY_CHARS)
+        if not cleaned_query:
+            return
+        try:
+            results = search_for_papers(query=cleaned_query, result_limit=result_limit, engine=engine) or []
+        except Exception as exc:
+            print(f"[radar] query failed: {cleaned_query} ({exc})")
+            return
+        _ingest_results(cleaned_query, [item for item in results if isinstance(item, dict)])
+
+    for query in topics:
+        _fetch_and_ingest(query, result_limit=per_topic)
+
     papers = list(dedup.values())
     papers.sort(
         key=lambda x: (
@@ -543,6 +928,100 @@ def run_literature_radar(
         reverse=True,
     )
     papers = papers[: max(1, int(max_papers))]
+
+    effective_translation_model = _sanitize_text(translation_model, max_chars=64) or "gpt-5.2"
+    translate_budget = _resolve_optional_limit(
+        translation_limit,
+        default_value=DEFAULT_TRANSLATION_LIMIT,
+    )
+    report_detail_limit = _resolve_optional_limit(
+        detail_paper_limit,
+        default_value=DEFAULT_REPORT_PAPER_LIMIT,
+    )
+    if report_detail_limit <= 0:
+        report_detail_limit = len(papers)
+    if translate_budget <= 0:
+        translate_budget = report_detail_limit
+    abstract_backfill_budget = _resolve_optional_limit(
+        abstract_backfill_limit,
+        default_value=DEFAULT_ABSTRACT_BACKFILL_LIMIT,
+    )
+    if abstract_backfill_budget <= 0:
+        abstract_backfill_budget = report_detail_limit
+
+    abstract_backfilled_count = 0
+    if backfill_missing_abstracts:
+        for paper in papers[:report_detail_limit]:
+            if _sanitize_text(paper.get("abstract"), max_chars=MAX_ABSTRACT_CHARS):
+                continue
+            key = _paper_key(paper.get("title", ""), _extract_year(paper.get("year")))
+            cached_abstract = previous_abstract_map.get(key)
+            if cached_abstract:
+                paper["abstract"] = cached_abstract
+                paper["abstract_source"] = "snapshot_cache"
+                paper["method_themes"] = _detect_method_themes(
+                    title=paper.get("title", ""),
+                    abstract=cached_abstract,
+                    venue=paper.get("venue", ""),
+                )
+                abstract_backfilled_count += 1
+                continue
+
+            if abstract_backfilled_count >= abstract_backfill_budget:
+                continue
+            filled_abstract, source_engine = _backfill_abstract_by_title(
+                title=paper.get("title", ""),
+                year=_extract_year(paper.get("year")),
+            )
+            if not filled_abstract:
+                continue
+
+            paper["abstract"] = filled_abstract
+            paper["abstract_source"] = source_engine
+            paper["method_themes"] = _detect_method_themes(
+                title=paper.get("title", ""),
+                abstract=filled_abstract,
+                venue=paper.get("venue", ""),
+            )
+            abstract_backfilled_count += 1
+
+    translation_client = None
+    translation_model_used: Optional[str] = None
+    if translate_abstracts and papers:
+        try:
+            translation_client, translation_model_used = create_client(effective_translation_model)
+        except Exception as exc:
+            print(
+                f"[radar] translation disabled (model={effective_translation_model} not available): {exc}"
+            )
+            translation_client = None
+            translation_model_used = None
+
+    translated_count = 0
+    for paper in papers[:report_detail_limit]:
+        key = _paper_key(paper.get("title", ""), _extract_year(paper.get("year")))
+        cached_zh = previous_translation_map.get(key)
+        if cached_zh:
+            paper["abstract_zh"] = cached_zh
+            translated_count += 1
+            continue
+
+        abstract = paper.get("abstract", "")
+        if (
+            not translate_abstracts
+            or translation_client is None
+            or translated_count >= translate_budget
+            or not abstract
+        ):
+            continue
+        translated = _translate_abstract_to_zh(
+            abstract,
+            client=translation_client,
+            model=translation_model_used or effective_translation_model,
+        )
+        if translated:
+            paper["abstract_zh"] = translated
+            translated_count += 1
 
     current_year = datetime.now().year
     recent_year_threshold = max(1900, current_year - max(1, int(recent_years)) + 1)
@@ -585,6 +1064,10 @@ def run_literature_radar(
         "papers": papers,
         "new_paper_count": len(new_papers),
         "method_insights": method_insights,
+        "translation_model": translation_model_used or effective_translation_model,
+        "translated_abstract_count": translated_count,
+        "abstract_backfilled_count": abstract_backfilled_count,
+        "detail_paper_limit": report_detail_limit,
     }
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -607,6 +1090,10 @@ def run_literature_radar(
         method_insights=method_insights,
         generated_at=generated_at,
         recent_year_threshold=recent_year_threshold,
+        detail_paper_limit=report_detail_limit,
+        translated_count=translated_count,
+        translation_model=translation_model_used or effective_translation_model,
+        abstract_backfilled_count=abstract_backfilled_count,
     )
     report_path = workspace_path / "literature_radar_report.md"
     _atomic_write_text(report_path, report_text)
@@ -620,6 +1107,10 @@ def run_literature_radar(
         "expanded_topics": topics,
         "recent_year_threshold": recent_year_threshold,
         "method_insights": method_insights,
+        "translated_abstract_count": translated_count,
+        "translation_model": translation_model_used or effective_translation_model,
+        "abstract_backfilled_count": abstract_backfilled_count,
+        "detail_paper_limit": report_detail_limit,
         "report_path": str(report_path),
         "latest_snapshot_path": str(latest_snapshot_path),
         "history_snapshot_path": str(history_snapshot_path),

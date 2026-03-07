@@ -334,7 +334,7 @@ python launch_mvp_workflow.py --phase optimize --run-dir workspace/results/paper
 python launch_mvp_workflow.py --phase refine --run-dir workspace/results/paper_writer/<WS>
 
 # Radar: periodic literature scouting + method-level next ideas
-python launch_mvp_workflow.py --phase radar --run-dir workspace/results/paper_writer/<WS> --radar-seed "CTA strategy" --year-min 2010 --year-max 2026
+python launch_mvp_workflow.py --phase radar --run-dir workspace/results/paper_writer/<WS> --radar-seed "CTA strategy" --year-min 2010 --year-max 2026 --radar-detail-papers 50 --radar-translate-limit 50 --radar-translate-model gpt-5.2 --radar-backfill-limit 50
 
 # Cloud: SSH remote execution + result backfill
 python launch_mvp_workflow.py --phase cloud --run-dir workspace/results/paper_writer/<WS> --remote-config remote.yaml
@@ -347,6 +347,8 @@ python launch_mvp_workflow.py --phase all --experiment paper_writer
 ```
 
 Year filters: prefer `--year-min/--year-max`. Legacy `--literature-year-after/--literature-year-before` remains compatible.
+Radar report now supports per-paper abstract digest (EN + ZH translation). Use `--radar-no-translate-abstracts` to disable translation.
+Missing abstracts are backfilled by title search (OpenAlex, then Semantic Scholar, then Brave Search if `BRAVE_API_KEY` is set, then Google Scholar via SerpAPI if configured). Use `--radar-no-backfill-abstracts` to disable backfill.
 
 ### Docker
 

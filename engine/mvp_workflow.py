@@ -422,6 +422,8 @@ def refresh_notes_with_literature_radar(notes_path: str, radar_summary: Dict[str
         f"Generated at: {radar_summary.get('generated_at', '')}",
         f"Papers kept: {radar_summary.get('paper_count', 0)}",
         f"New since previous run: {radar_summary.get('new_paper_count', 0)}",
+        f"Translated abstracts: {radar_summary.get('translated_abstract_count', 0)}",
+        f"Backfilled abstracts: {radar_summary.get('abstract_backfilled_count', 0)}",
         "",
         "### Expanded Topics",
     ]

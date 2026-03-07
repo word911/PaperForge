@@ -46,6 +46,8 @@ $env:OPENALEX_MAIL_ADDRESS = "你的邮箱@example.com"
 
 ```powershell
 $env:S2_API_KEY = "你的SemanticScholarKey"
+$env:BRAVE_API_KEY = "你的BraveSearchKey" # 可选：Brave 回补
+$env:SERPAPI_API_KEY = "你的SerpAPIKey"   # 可选：Google Scholar 回补
 ```
 
 如果使用 Anthropic：
@@ -213,10 +215,16 @@ python launch_mvp_workflow.py `
   --radar-max-topics 12 `
   --radar-per-topic 8 `
   --radar-max-papers 120 `
-  --radar-recent-years 3
+  --radar-recent-years 3 `
+  --radar-detail-papers 50 `
+  --radar-translate-limit 50 `
+  --radar-translate-model gpt-5.2 `
+  --radar-backfill-limit 50
 ```
 
 年份筛选建议使用 `--year-min/--year-max`。历史参数 `--literature-year-after/--literature-year-before` 仍兼容。
+默认会生成“逐篇摘要（英文）+ 中文翻译”。如需关闭翻译，可加 `--radar-no-translate-abstracts`。
+默认会对缺失摘要按标题自动回补（先 OpenAlex，后 Semantic Scholar；若配置 `BRAVE_API_KEY` 再走 Brave；若配置 `SERPAPI_API_KEY` 再走 Google Scholar）。如需关闭，可加 `--radar-no-backfill-abstracts`。
 
 产物：
 

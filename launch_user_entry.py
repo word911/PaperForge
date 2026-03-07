@@ -327,6 +327,12 @@ def _build_mvp_cmd(args: argparse.Namespace, passthrough: list[str]) -> list[str
     _append_opt(cmd, "--radar-per-topic", args.radar_per_topic)
     _append_opt(cmd, "--radar-max-papers", args.radar_max_papers)
     _append_opt(cmd, "--radar-recent-years", args.radar_recent_years)
+    _append_opt(cmd, "--radar-translate-model", args.radar_translate_model)
+    _append_opt(cmd, "--radar-translate-limit", args.radar_translate_limit)
+    _append_opt(cmd, "--radar-detail-papers", args.radar_detail_papers)
+    _append_flag(cmd, "--radar-no-translate-abstracts", not args.radar_translate_abstracts)
+    _append_opt(cmd, "--radar-backfill-limit", args.radar_backfill_limit)
+    _append_flag(cmd, "--radar-no-backfill-abstracts", not args.radar_backfill_abstracts)
 
     cmd.extend(passthrough)
     return cmd
@@ -414,6 +420,14 @@ def build_parser() -> argparse.ArgumentParser:
     mvp.add_argument("--radar-per-topic", type=int, default=None)
     mvp.add_argument("--radar-max-papers", type=int, default=None)
     mvp.add_argument("--radar-recent-years", type=int, default=None)
+    mvp.add_argument("--radar-translate-model", default=None)
+    mvp.add_argument("--radar-translate-limit", type=int, default=None)
+    mvp.add_argument("--radar-detail-papers", type=int, default=None)
+    mvp.add_argument("--radar-translate-abstracts", action="store_true", default=True)
+    mvp.add_argument("--radar-no-translate-abstracts", dest="radar_translate_abstracts", action="store_false")
+    mvp.add_argument("--radar-backfill-abstracts", action="store_true", default=True)
+    mvp.add_argument("--radar-no-backfill-abstracts", dest="radar_backfill_abstracts", action="store_false")
+    mvp.add_argument("--radar-backfill-limit", type=int, default=None)
 
     mvp.add_argument("--run-cloud-cycle", action="store_true")
     mvp.add_argument("--cloud-run-dir", default=None)
