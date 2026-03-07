@@ -11,10 +11,11 @@ PaperForge automates the full lifecycle of academic paper generation — from id
 ## Features
 
 ### Paper Writing Pipeline
-- **Multi-phase pipeline**: `bootstrap → feedback → optimize → refine → cloud` with persistent workspace state and checkpoint/resume
+- **Multi-phase pipeline**: `bootstrap → feedback → optimize → refine → radar → cloud` with persistent workspace state and checkpoint/resume
 - **Multi-model routing**: assign different LLMs per stage (idea / code / writeup / review)
 - **Dual protocol support**: Anthropic native API and OpenAI-compatible API (including third-party gateways)
 - **Literature search integration**: OpenAlex and Semantic Scholar queries feed directly into writing context
+- **Literature radar**: seed-topic expansion + snapshot diff + method-level next-idea report for find/read/review workflows
 - **Prompt caching**: Anthropic prompt caching reduces token cost across multi-turn writing sessions
 - **Anti-AI-detection style control**: customizable prompt library with 20+ academic writing prompts
 - **LaTeX sanitization**: automatic cleanup of stylistic artifacts and formatting inconsistencies in generated `.tex` files
@@ -60,7 +61,7 @@ export OPENAI_WRITEUP_BASE_URL='https://api.openai.com/v1'
 
 ## Architecture
 
-### Overview: Entry Points and Five-Phase Pipeline
+### Overview: Entry Points and Six-Phase Pipeline
 
 ```mermaid
 flowchart TB
@@ -73,16 +74,17 @@ flowchart TB
     UE --> LS
     UE --> LM
 
-    subgraph pipeline [Five-Phase Writing Pipeline]
+    subgraph pipeline [Six-Phase Writing Pipeline]
         direction TB
         B["Phase 1: Bootstrap<br/>init workspace + run_0<br/>literature search<br/>first draft PDF"]
         F["Phase 2: Feedback<br/>ingest user uploads<br/>update notes<br/>revise paper"]
         O["Phase 3: Optimize<br/>multi-round experiments<br/>update plots + data<br/>revise paper"]
         R["Phase 4: Refine<br/>deep writeup polish<br/>6x citation + 3x fix<br/>auto-review scoring"]
-        C["Phase 5: Cloud<br/>SSH remote training<br/>download results<br/>backfill into paper"]
+        D["Phase 5: Radar<br/>topic expansion<br/>literature snapshot diff<br/>method-level insights"]
+        C["Phase 6: Cloud<br/>SSH remote training<br/>download results<br/>backfill into paper"]
 
-        B --> F --> O --> R
-        R -.->|optional| C
+        B --> F --> O --> R --> D
+        D -.->|optional| C
         C -.->|backfill| F
     end
 
@@ -91,6 +93,7 @@ flowchart TB
     LM --> F
     LM --> O
     LM --> R
+    LM --> D
     LM --> C
 
     subgraph engineCore [engine/ Core Modules]
@@ -260,7 +263,7 @@ PaperForge/
 │
 ├── launch_user_entry.py           # Unified entry point (recommended)
 ├── launch_scientist.py            # Full-auto pipeline (idea → writeup → review)
-├── launch_mvp_workflow.py         # Phased pipeline (bootstrap/feedback/optimize/refine/cloud)
+├── launch_mvp_workflow.py         # Phased pipeline (bootstrap/feedback/optimize/refine/radar/cloud)
 ├── run_cloud_pipeline_cycle.py    # Cloud cycle: SSH remote + local pipeline + sync
 ├── sync_cloud_results_to_uploads.py  # Incremental result ingestion
 ├── prompt_library.py              # 20+ academic writing prompts (anti-AI-detection)
@@ -330,6 +333,9 @@ python launch_mvp_workflow.py --phase optimize --run-dir workspace/results/paper
 # Refine: final polish
 python launch_mvp_workflow.py --phase refine --run-dir workspace/results/paper_writer/<WS>
 
+# Radar: periodic literature scouting + method-level next ideas
+python launch_mvp_workflow.py --phase radar --run-dir workspace/results/paper_writer/<WS> --radar-seed "CTA strategy" --year-min 2010 --year-max 2026
+
 # Cloud: SSH remote execution + result backfill
 python launch_mvp_workflow.py --phase cloud --run-dir workspace/results/paper_writer/<WS> --remote-config remote.yaml
 ```
@@ -339,6 +345,8 @@ python launch_mvp_workflow.py --phase cloud --run-dir workspace/results/paper_wr
 ```bash
 python launch_mvp_workflow.py --phase all --experiment paper_writer
 ```
+
+Year filters: prefer `--year-min/--year-max`. Legacy `--literature-year-after/--literature-year-before` remains compatible.
 
 ### Docker
 

@@ -200,6 +200,31 @@ python launch_mvp_workflow.py `
 - `paper_refined.pdf`
 - 可能生成 `latex/checkpoints/`
 
+#### B6) Radar：文献雷达（找论文/读论文/方法追踪）
+
+```powershell
+python launch_mvp_workflow.py `
+  --phase radar `
+  --run-dir "$WS" `
+  --engine openalex `
+  --radar-seed "CTA strategy" `
+  --year-min 2010 `
+  --year-max 2026 `
+  --radar-max-topics 12 `
+  --radar-per-topic 8 `
+  --radar-max-papers 120 `
+  --radar-recent-years 3
+```
+
+年份筛选建议使用 `--year-min/--year-max`。历史参数 `--literature-year-after/--literature-year-before` 仍兼容。
+
+产物：
+
+- `literature_radar_report.md`：扩展主题、方法分布、新增文献、下一步方法建议
+- `artifacts/literature_radar/latest_snapshot.json`：最新快照
+- `artifacts/literature_radar/history/snapshot_*.json`：历史快照（用于“定期更新”对比）
+- `notes.txt` 自动更新 `Literature Radar` 区块
+
 ### C. 云端执行与回灌（可选）
 
 #### C1) 配置 `remote.yaml`
@@ -281,4 +306,3 @@ $WS = Get-ChildItem .\workspace\results\paper_writer |
 - 预检：`engine/preflight.py`
 - 远程执行：`engine/remote_runner.py`
 - 结果同步：`sync_cloud_results_to_uploads.py`
-

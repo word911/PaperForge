@@ -44,6 +44,7 @@ if __name__ == "__main__":
     _require_virtualenv("launch_mvp_workflow.py")
 
 from engine.llm import AVAILABLE_LLMS
+from engine.literature_radar import run_literature_radar
 from engine.mvp_workflow import (
     append_upload_feedback_to_notes,
     create_workspace_from_template,
@@ -54,6 +55,7 @@ from engine.mvp_workflow import (
     load_workflow_state,
     next_run_index,
     refresh_notes_with_literature,
+    refresh_notes_with_literature_radar,
     refresh_notes_with_run_feedback,
     run_experiment_once,
     run_plotting,
@@ -323,6 +325,36 @@ def _run_writeup_phase(
     _copy_phase_pdf(workspace, idea_name=idea["Name"], output_name=output_pdf_name)
 
 
+def _resolve_year_filters(args: argparse.Namespace) -> tuple[int | None, int | None]:
+    year_min = args.year_min
+    year_max = args.year_max
+    legacy_min = args.literature_year_after
+    legacy_max = args.literature_year_before
+
+    if year_min is None and legacy_min is not None:
+        year_min = legacy_min
+    elif year_min is not None and legacy_min is not None and year_min != legacy_min:
+        raise SystemExit(
+            "Year filter conflict: --year-min and --literature-year-after are both set "
+            f"with different values ({year_min} vs {legacy_min})."
+        )
+
+    if year_max is None and legacy_max is not None:
+        year_max = legacy_max
+    elif year_max is not None and legacy_max is not None and year_max != legacy_max:
+        raise SystemExit(
+            "Year filter conflict: --year-max and --literature-year-before are both set "
+            f"with different values ({year_max} vs {legacy_max})."
+        )
+
+    if year_min is not None and year_max is not None and int(year_min) >= int(year_max):
+        raise SystemExit(
+            f"Invalid year range: --year-min ({year_min}) must be less than --year-max ({year_max})."
+        )
+
+    return year_min, year_max
+
+
 def _phase_bootstrap(args: argparse.Namespace, workspace: Path | None) -> Path:
     if workspace is None:
         try:
@@ -352,13 +384,14 @@ def _phase_bootstrap(args: argparse.Namespace, workspace: Path | None) -> Path:
     ensure_upload_interface(str(workspace))
 
     if args.refresh_literature:
+        year_min, year_max = _resolve_year_filters(args)
         refresh_notes_with_literature(
             notes_path=str(notes_path),
             query=args.title,
             engine=args.engine,
             top_k=args.literature_top_k,
-            year_before=args.literature_year_before,
-            year_after=args.literature_year_after,
+            year_before=year_max,
+            year_after=year_min,
         )
 
     mvp_ok = False
@@ -412,13 +445,14 @@ def _phase_feedback(args: argparse.Namespace, workspace: Path) -> None:
         refresh_notes_with_run_feedback(str(workspace), str(notes_path))
 
     if args.refresh_literature:
+        year_min, year_max = _resolve_year_filters(args)
         refresh_notes_with_literature(
             notes_path=str(notes_path),
             query=args.title,
             engine=args.engine,
             top_k=args.literature_top_k,
-            year_before=args.literature_year_before,
-            year_after=args.literature_year_after,
+            year_before=year_max,
+            year_after=year_min,
         )
 
     if not args.skip_writeup:
@@ -528,6 +562,71 @@ def _phase_cloud(args: argparse.Namespace, workspace: Path) -> None:
         raise SystemExit(proc.returncode)
 
 
+def _resolve_radar_seed(args: argparse.Namespace, workspace: Path) -> str:
+    explicit = (args.radar_seed or "").strip()
+    if explicit:
+        return explicit
+
+    idea_meta_path = workspace / "workflow_idea.json"
+    if idea_meta_path.exists():
+        idea = load_idea_metadata(str(workspace))
+        idea_title = (idea.get("Title") or "").strip()
+        if idea_title:
+            return idea_title
+
+    title = (args.title or "").strip()
+    default_title = "Iterative Academic Paper Writing with Upload Feedback"
+    if title and title != default_title:
+        return title
+
+    raise SystemExit(
+        "phase `radar` requires a meaningful seed topic. "
+        "Please pass --radar-seed \"<your topic>\"."
+    )
+
+
+def _phase_radar(args: argparse.Namespace, workspace: Path) -> None:
+    seed_topic = _resolve_radar_seed(args, workspace)
+    year_min, year_max = _resolve_year_filters(args)
+
+    try:
+        summary = run_literature_radar(
+            workspace=str(workspace),
+            seed_topic=seed_topic,
+            engine=args.engine,
+            max_topics=args.radar_max_topics,
+            per_topic=args.radar_per_topic,
+            max_papers=args.radar_max_papers,
+            year_before=year_max,
+            year_after=year_min,
+            recent_years=args.radar_recent_years,
+        )
+    except Exception as exc:
+        raise SystemExit(f"[radar] failed: {exc}") from exc
+
+    notes_path = workspace / "notes.txt"
+    if notes_path.exists():
+        try:
+            refresh_notes_with_literature_radar(str(notes_path), summary)
+        except Exception as exc:
+            raise SystemExit(f"[radar] failed to update notes.txt: {exc}") from exc
+
+    _update_state(
+        workspace,
+        phase="radar_completed",
+        radar_report=summary.get("report_path"),
+        radar_snapshot=summary.get("latest_snapshot_path"),
+        radar_seed=seed_topic,
+    )
+    print(
+        "[radar] papers={papers} new={new} report={report}".format(
+            papers=summary.get("paper_count", 0),
+            new=summary.get("new_paper_count", 0),
+            report=summary.get("report_path", ""),
+        )
+    )
+
+
 def _default_pipeline_root() -> str:
     return ""
 
@@ -548,7 +647,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="MVP staged workflow launcher")
     p.add_argument(
         "--phase",
-        choices=["bootstrap", "feedback", "optimize", "refine", "cloud", "all"],
+        choices=["bootstrap", "feedback", "optimize", "refine", "cloud", "radar", "all"],
         default="bootstrap",
     )
     p.add_argument("--experiment", default="paper_writer")
@@ -588,13 +687,54 @@ def build_parser() -> argparse.ArgumentParser:
         "--literature-year-before",
         type=int,
         default=None,
-        help="Only keep papers with year < this value (e.g. 2010).",
+        help="[Compat] Only keep papers with year < this value. Prefer --year-max.",
     )
     p.add_argument(
         "--literature-year-after",
         type=int,
         default=None,
-        help="Only keep papers with year > this value.",
+        help="[Compat] Only keep papers with year > this value. Prefer --year-min.",
+    )
+    p.add_argument(
+        "--year-min",
+        type=int,
+        default=None,
+        help="Keep papers with year > this value (preferred alias of --literature-year-after).",
+    )
+    p.add_argument(
+        "--year-max",
+        type=int,
+        default=None,
+        help="Keep papers with year < this value (preferred alias of --literature-year-before).",
+    )
+    p.add_argument(
+        "--radar-seed",
+        default=None,
+        help="Seed keyword for literature radar expansion (defaults to --title).",
+    )
+    p.add_argument(
+        "--radar-max-topics",
+        type=int,
+        default=12,
+        help="Maximum number of expanded topics for radar search.",
+    )
+    p.add_argument(
+        "--radar-per-topic",
+        type=int,
+        default=8,
+        help="Number of papers fetched per expanded topic.",
+    )
+    p.add_argument(
+        "--radar-max-papers",
+        type=int,
+        default=120,
+        help="Maximum number of deduplicated papers kept in radar snapshot.",
+    )
+    p.add_argument(
+        "--radar-recent-years",
+        type=int,
+        default=3,
+        help="Recent-year window used for method trend extraction.",
     )
 
     p.add_argument("--run-cloud-cycle", action="store_true")
@@ -643,6 +783,8 @@ def main() -> None:
         _phase_refine(args, _require_workspace(workspace, args.phase))
     elif args.phase == "cloud":
         _phase_cloud(args, _require_workspace(workspace, args.phase))
+    elif args.phase == "radar":
+        _phase_radar(args, _require_workspace(workspace, args.phase))
     elif args.phase == "all":
         workspace = _phase_bootstrap(args, workspace)
         if args.run_cloud_cycle:
@@ -650,6 +792,7 @@ def main() -> None:
         _phase_feedback(args, workspace)
         _phase_optimize(args, workspace)
         _phase_refine(args, workspace)
+        _phase_radar(args, workspace)
     else:
         raise SystemExit(f"Unsupported phase: {args.phase}")
 

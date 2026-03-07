@@ -314,6 +314,19 @@ def _build_mvp_cmd(args: argparse.Namespace, passthrough: list[str]) -> list[str
     _append_opt(cmd, "--pipeline-mode", args.pipeline_mode)
     _append_opt(cmd, "--pipeline-hardware-profile", args.pipeline_hardware_profile)
     _append_opt(cmd, "--pipeline-device", args.pipeline_device)
+    _append_opt(cmd, "--remote-config", args.remote_config)
+
+    _append_opt(cmd, "--literature-top-k", args.literature_top_k)
+    _append_opt(cmd, "--literature-year-before", args.literature_year_before)
+    _append_opt(cmd, "--literature-year-after", args.literature_year_after)
+    _append_opt(cmd, "--year-min", args.year_min)
+    _append_opt(cmd, "--year-max", args.year_max)
+
+    _append_opt(cmd, "--radar-seed", args.radar_seed)
+    _append_opt(cmd, "--radar-max-topics", args.radar_max_topics)
+    _append_opt(cmd, "--radar-per-topic", args.radar_per_topic)
+    _append_opt(cmd, "--radar-max-papers", args.radar_max_papers)
+    _append_opt(cmd, "--radar-recent-years", args.radar_recent_years)
 
     cmd.extend(passthrough)
     return cmd
@@ -367,10 +380,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     mvp = subparsers.add_parser(
         "mvp",
-        help="分阶段主线：bootstrap/feedback/optimize/refine/cloud/all",
+        help="分阶段主线：bootstrap/feedback/optimize/refine/radar/cloud/all",
     )
     _add_common_api_args(mvp)
-    mvp.add_argument("--phase", choices=["bootstrap", "feedback", "optimize", "refine", "cloud", "all"], default="bootstrap")
+    mvp.add_argument(
+        "--phase",
+        choices=["bootstrap", "feedback", "optimize", "refine", "radar", "cloud", "all"],
+        default="bootstrap",
+    )
     mvp.add_argument("--experiment", default="paper_writer")
     mvp.add_argument("--run-dir", default=None)
     mvp.add_argument("--engine", choices=["semanticscholar", "openalex"], default="openalex")
@@ -378,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
     mvp.add_argument("--optimize-runs", type=int, default=2)
     mvp.add_argument("--refine-profile", choices=["fast", "balanced", "deep"], default="balanced")
     mvp.add_argument("--idea-name", default="paper_writer_user_entry")
-    mvp.add_argument("--title", default="Iterative Academic Paper Writing with User API Entry")
+    mvp.add_argument("--title", default="Iterative Academic Paper Writing with Upload Feedback")
     mvp.add_argument(
         "--description",
         default="User entry with selectable API protocols and stage models.",
@@ -386,6 +403,18 @@ def build_parser() -> argparse.ArgumentParser:
     mvp.add_argument("--skip-writeup", action="store_true")
     mvp.add_argument("--skip-mvp-run", action="store_true")
     mvp.add_argument("--refresh-literature", action="store_true")
+    mvp.add_argument("--literature-top-k", type=int, default=None)
+    mvp.add_argument("--literature-year-before", type=int, default=None)
+    mvp.add_argument("--literature-year-after", type=int, default=None)
+    mvp.add_argument("--year-min", type=int, default=None)
+    mvp.add_argument("--year-max", type=int, default=None)
+
+    mvp.add_argument("--radar-seed", default=None)
+    mvp.add_argument("--radar-max-topics", type=int, default=None)
+    mvp.add_argument("--radar-per-topic", type=int, default=None)
+    mvp.add_argument("--radar-max-papers", type=int, default=None)
+    mvp.add_argument("--radar-recent-years", type=int, default=None)
+
     mvp.add_argument("--run-cloud-cycle", action="store_true")
     mvp.add_argument("--cloud-run-dir", default=None)
     mvp.add_argument("--pipeline-root", default=None)
@@ -394,6 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
     mvp.add_argument("--pipeline-mode", choices=["auto", "real", "sim"], default=None)
     mvp.add_argument("--pipeline-hardware-profile", default=None)
     mvp.add_argument("--pipeline-device", default=None)
+    mvp.add_argument("--remote-config", default=None)
     mvp.add_argument("--cloud-skip-run", action="store_true")
     mvp.add_argument("--cloud-skip-sync", action="store_true")
 

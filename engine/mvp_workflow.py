@@ -6,7 +6,7 @@ import shutil
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from engine.generate_ideas import search_for_papers
 
@@ -412,6 +412,33 @@ def refresh_notes_with_literature(
         authors = paper.get("authors", "Unknown")
         lines.append(f"{i}. {title} ({year}, {venue}) - {authors}")
     _upsert_notes_block(notes_path, "LITERATURE", "\n".join(lines))
+
+
+def refresh_notes_with_literature_radar(notes_path: str, radar_summary: Dict[str, Any]) -> None:
+    lines = [
+        "## Literature Radar",
+        f"Seed topic: `{radar_summary.get('seed_topic', '')}`",
+        f"Engine: `{radar_summary.get('engine', '')}`",
+        f"Generated at: {radar_summary.get('generated_at', '')}",
+        f"Papers kept: {radar_summary.get('paper_count', 0)}",
+        f"New since previous run: {radar_summary.get('new_paper_count', 0)}",
+        "",
+        "### Expanded Topics",
+    ]
+    for topic in radar_summary.get("expanded_topics", []):
+        lines.append(f"- {topic}")
+
+    lines.append("")
+    lines.append("### Method-Level Next Ideas")
+    for item in radar_summary.get("method_insights", []):
+        lines.append(f"- {item}")
+
+    report_path = radar_summary.get("report_path")
+    if report_path:
+        lines.append("")
+        lines.append(f"Report: {report_path}")
+
+    _upsert_notes_block(notes_path, "LITERATURE_RADAR", "\n".join(lines))
 
 
 def _copy_file_unique(src: Path, dst_dir: Path, preferred_name: Optional[str] = None) -> str:
